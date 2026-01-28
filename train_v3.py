@@ -1,3 +1,12 @@
+"""
+Training script for SudokuTransformerV3 (Unified Action Tokens + Oracle Order)
+
+Key features:
+- Single token = Position + Value combined
+- Oracle order (easiest cells first)
+- Standard next-token prediction
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,8 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
 
-from models.transformer import SudokuTransformer, VOCAB_SIZE
-from dataset.ar_dataset import SudokuARDataset, collate_fn
+from models.transformer_v3 import SudokuTransformerV3, VOCAB_SIZE, SOS_TOKEN
+from dataset.ar_dataset_v3 import SudokuARDatasetV3, collate_fn_v3
 
 # Hyperparams
 BATCH_SIZE = 64
@@ -16,68 +25,69 @@ WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 def train():
     os.makedirs("checkpoints", exist_ok=True)
 
     # 1. Dataset
-    train_ds = SudokuARDataset("data/sudoku-trajectory", split="train", max_samples=None)
+    train_ds = SudokuARDatasetV3("data/sudoku-trajectory", split="train", max_samples=None)
 
-    # Use custom collate_fn for proper padding
     train_dl = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
         pin_memory=True,
         num_workers=4,
-        collate_fn=collate_fn
+        collate_fn=collate_fn_v3
     )
 
     print(f"Dataset Size: {len(train_ds)}")
     print(f"DataLoader Length: {len(train_dl)}")
 
     # 2. Model
-    model = SudokuTransformer().to(DEVICE)
+    model = SudokuTransformerV3(
+        num_layers=4,
+        hidden_dim=384,
+        num_heads=6,
+    ).to(DEVICE)
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    print(f"Vocab Size: {VOCAB_SIZE} (729 actions + 1 SOS)")
 
     # 3. Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95))
 
-    # 4. Scheduler (OneCycleLR)
+    # 4. Scheduler
     total_steps = len(train_dl) * EPOCHS
-    if total_steps <= 0:
-        total_steps = EPOCHS  # Fallback
-
     print(f"Total Steps: {total_steps}")
 
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LR, total_steps=total_steps, pct_start=0.1)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=LR, total_steps=total_steps, pct_start=0.1
+    )
 
-    # 5. Loss function
-    # Single unified cross-entropy loss for next token prediction
-    # ignore_index=0 to skip loss computation on padding tokens (SOS_TOKEN=0)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    # 5. Loss function (ignore SOS_TOKEN used for padding)
+    criterion = nn.CrossEntropyLoss(ignore_index=SOS_TOKEN)
 
     for epoch in range(EPOCHS):
         model.train()
         pbar = tqdm(train_dl, desc=f"Epoch {epoch+1}/{EPOCHS}")
         total_loss = 0
+        total_correct = 0
         total_tokens = 0
 
         for batch in pbar:
-            input_ids = batch['input_ids'].to(DEVICE)       # [b, seq_len]
-            target_ids = batch['target_ids'].to(DEVICE)     # [b, seq_len]
-            attention_mask = batch['attention_mask'].to(DEVICE)  # [b, seq_len]
+            token_in = batch['token_in'].to(DEVICE)
+            token_tgt = batch['token_tgt'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
 
             optimizer.zero_grad()
 
             # Forward
-            logits = model(input_ids)  # [b, seq_len, vocab_size]
+            logits = model(token_in)  # [b, seq_len, vocab_size]
 
-            # Flatten for cross-entropy
-            # logits: [b * seq_len, vocab_size]
-            # targets: [b * seq_len]
+            # Compute loss
             loss = criterion(
                 logits.view(-1, VOCAB_SIZE),
-                target_ids.view(-1)
+                token_tgt.view(-1)
             )
 
             loss.backward()
@@ -85,26 +95,29 @@ def train():
             optimizer.step()
             scheduler.step()
 
-            # Compute token-level accuracy (excluding padding)
+            # Compute accuracy
             with torch.no_grad():
-                preds = logits.argmax(dim=-1)  # [b, seq_len]
+                preds = logits.argmax(dim=-1)
                 mask = attention_mask.bool()
-                correct = ((preds == target_ids) & mask).sum().item()
+                correct = ((preds == token_tgt) & mask).sum().item()
                 total = mask.sum().item()
 
             total_loss += loss.item() * total
+            total_correct += correct
             total_tokens += total
 
+            acc = correct / total * 100 if total > 0 else 0
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
-                "acc": f"{correct/total*100:.1f}%"
+                "acc": f"{acc:.1f}%"
             })
 
         avg_loss = total_loss / total_tokens if total_tokens > 0 else 0
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+        avg_acc = total_correct / total_tokens * 100 if total_tokens > 0 else 0
+        print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.2f}%")
 
-        # Save checkpoint every epoch
-        torch.save(model.state_dict(), f"checkpoints/ar_trm_ep{epoch+1}.pth")
+        # Save checkpoint
+        torch.save(model.state_dict(), f"checkpoints/ar_trm_v3_ep{epoch+1}.pth")
 
 
 if __name__ == "__main__":
