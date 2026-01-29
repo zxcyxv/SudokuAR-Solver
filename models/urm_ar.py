@@ -178,18 +178,22 @@ class URMBlock(nn.Module):
         self.self_attn = CausalAttention(config)
         self.mlp = ConvSwiGLU_AR(config) # "Short Convolution"
         
+        # [FIX] Initialize Norm layers here to register them as parameters
+        self.norm1 = RMSNorm(config.hidden_size, self.rms_norm_eps)
+        self.norm2 = RMSNorm(config.hidden_size, self.rms_norm_eps)
+        
     def forward(self, x, layer_past=None, use_cache=False):
         # layer_past: (attn_past, conv_past)
         attn_past = layer_past[0] if layer_past is not None else None
         conv_past = layer_past[1] if layer_past is not None else None
         
         # Attention
-        norm_x = RMSNorm(x.shape[-1], self.rms_norm_eps)(x)
+        norm_x = self.norm1(x)
         attn_out, attn_new = self.self_attn(norm_x, past_kv=attn_past)
         x = x + attn_out
         
         # ConvSwiGLU
-        norm_x = RMSNorm(x.shape[-1], self.rms_norm_eps)(x)
+        norm_x = self.norm2(x)
         mlp_out, conv_new = self.mlp(norm_x, conv_cache=conv_past)
         x = x + mlp_out
         
