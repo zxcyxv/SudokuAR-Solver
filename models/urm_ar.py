@@ -69,7 +69,7 @@ class CausalAttention(nn.Module):
         
         self.rope = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
 
-    def forward(self, x):
+    def forward(self, x, past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         b, s, d = x.shape
         qkv = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -78,7 +78,14 @@ class CausalAttention(nn.Module):
         k = k.view(b, s, self.num_heads, self.head_dim)
         v = v.view(b, s, self.num_heads, self.head_dim)
 
-        cos, sin = self.rope(q, seq_len=s)
+        # RoPE with Cache Offset
+        past_len = past_kv[0].shape[2] if past_kv is not None else 0
+        cos, sin = self.rope(q, seq_len=s + past_len)
+        
+        # Slice RoPE for current position
+        cos = cos[:, past_len:past_len+s, :, :]
+        sin = sin[:, past_len:past_len+s, :, :]
+        
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # Transpose for SDPA: [b, h, s, d]
@@ -86,11 +93,23 @@ class CausalAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Causal Mask is handled efficiently by is_causal=True in scaled_dot_product_attention
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Update KV Cache
+        if past_kv is not None:
+            k_cache, v_cache = past_kv
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+            
+        current_kv = (k, v)
+
+        # [FIX] Determine if causal masking is needed
+        # If sequence length s > 1, we are processing a chunk (Training or Prompt), so we need causal mask.
+        # If s == 1, we are generating token-by-token. All keys in 'k' are valid history/present.
+        use_causal_mask = (s > 1)
+        
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=use_causal_mask)
         
         out = out.transpose(1, 2).contiguous().view(b, s, d)
-        return self.o_proj(out)
+        return self.o_proj(out), current_kv
 
 class ConvSwiGLU_AR(nn.Module):
     """
@@ -120,30 +139,37 @@ class ConvSwiGLU_AR(nn.Module):
         self.down_proj = nn.Linear(inter, hidden, bias=False)
         self.act = nn.SiLU()
 
-    def forward(self, x):
+    def forward(self, x, conv_cache: Optional[torch.Tensor] = None):
         # x: [b, s, d]
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        
-        # Mixing: SiLU(gate) * up
-        # NOTE: URM Paper Figure 2 says Conv is inside gate branch, but Eq 136 says Conv is after mixing.
-        # User feedback and Equ 136 confirm: Conv is applied to the mixed output.
         x_ffn = self.act(gate) * up  # [b, s, inter]
         
-        # CAUSAL CONVOLUTION IMPLEMENTATION
-        # Transpose to [b, inter, s] for Conv1d
-        x_conv_in = x_ffn.transpose(1, 2)
+        # CAUSAL CONVOLUTION WITH CACHE
+        x_conv_in = x_ffn.transpose(1, 2) # [b, inter, s]
         
-        # Left Pad: (kernel_size - 1) zeros on the left
-        # Padding applied to last dim (time)
-        x_conv_in = F.pad(x_conv_in, (self.kernel_size - 1, 0))
-        
-        out_conv = self.dwconv(x_conv_in)
-        # Output length should match input length (s)
+        if conv_cache is not None:
+            # Inference Mode: Prepend last input from cache
+            # conv_cache: [b, inter, kernel_size-1] (Previous inputs)
+            # For kernel=2, cache is just the single previous token.
+            x_conv_in = torch.cat([conv_cache, x_conv_in], dim=2)
+            
+            # No padding needed as we have history
+            out_conv = self.dwconv(x_conv_in)
+            
+            # Save new cache (last k-1 inputs of current sequence)
+            new_conv_cache = x_conv_in[:, :, -(self.kernel_size-1):]
+        else:
+            # Training Mode / First Step: Use Pad
+            x_pad = F.pad(x_conv_in, (self.kernel_size - 1, 0))
+            out_conv = self.dwconv(x_pad)
+            
+            # If we want to support starting cache generation from full sequence:
+            new_conv_cache = x_conv_in[:, :, -(self.kernel_size-1):] if self.training is False else None
         
         out_conv = self.act(out_conv)
         out_conv = out_conv.transpose(1, 2) # Back to [b, s, inter]
         
-        return self.down_proj(out_conv)
+        return self.down_proj(out_conv), new_conv_cache
 
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig):
@@ -152,11 +178,23 @@ class URMBlock(nn.Module):
         self.self_attn = CausalAttention(config)
         self.mlp = ConvSwiGLU_AR(config) # "Short Convolution"
         
-    def forward(self, x):
-        # Pre-Norm architecture
-        x = x + self.self_attn(RMSNorm(x.shape[-1], self.rms_norm_eps)(x))
-        x = x + self.mlp(RMSNorm(x.shape[-1], self.rms_norm_eps)(x))
-        return x
+    def forward(self, x, layer_past=None, use_cache=False):
+        # layer_past: (attn_past, conv_past)
+        attn_past = layer_past[0] if layer_past is not None else None
+        conv_past = layer_past[1] if layer_past is not None else None
+        
+        # Attention
+        norm_x = RMSNorm(x.shape[-1], self.rms_norm_eps)(x)
+        attn_out, attn_new = self.self_attn(norm_x, past_kv=attn_past)
+        x = x + attn_out
+        
+        # ConvSwiGLU
+        norm_x = RMSNorm(x.shape[-1], self.rms_norm_eps)(x)
+        mlp_out, conv_new = self.mlp(norm_x, conv_cache=conv_past)
+        x = x + mlp_out
+        
+        current_cache = (attn_new, conv_new) if use_cache else None
+        return x, current_cache
 
 class SudokuURM_AR(nn.Module):
     def __init__(self, config: Optional[URMConfig] = None, **kwargs):
@@ -183,43 +221,58 @@ class SudokuURM_AR(nn.Module):
         # Weight tying
         self.token_emb.weight = self.lm_head.weight
 
-    def forward(self, token_ids):
+    def forward(self, token_ids, use_cache=False, past_caches=None):
         # token_ids: [b, s]
+        # past_caches: List[List[Tuple[Tensor, Tensor]]] -> [Recurrence][Layer] -> (Attn, Conv)
+        
         x = self.token_emb(token_ids)
         b, s, d = x.shape
         
         # TBPTL: Freeze gradients for the first `n_freeze` steps of recurrence
-        # This matches the paper's "forward-only" training for initial loops
         n_freeze = 2 
+        
+        new_caches = [] if use_cache else None
 
-        # Recurrence Loop (Effective Depth = num_layers * n_recurrence)
+        # Recurrence Loop
         for step in range(self.config.n_recurrence):
-            # TBPTL Logic: Detach state to stop gradient back-flow for early steps
-            if step < n_freeze:
+            # TBPTL Logic
+            if step < n_freeze and self.training: # Apply only during training
                 x = x.detach()
 
-            # Add Loop Coordinate Embedding
-            # We broadcast step_emb [1, 1, d] to [b, s, d]
+            # Loop Coordinate Embedding
             step_idx = torch.tensor([step], device=x.device)
             loop_signal = self.loop_emb(step_idx).unsqueeze(1) # [1, 1, d]
-            
-            # Inject loop signal into hidden state
             x = x + loop_signal
             
-            # Apply Transition Function (Shared Layers)
-            for layer in self.layers:
-                x = layer(x)
+            step_cache_out = []
+            step_past_caches = past_caches[step] if past_caches is not None else None
+            
+            # Layer Loop
+            for layer_idx, layer in enumerate(self.layers):
+                layer_past = step_past_caches[layer_idx] if step_past_caches is not None else None
+                
+                x, layer_new = layer(x, layer_past=layer_past, use_cache=use_cache)
+                
+                if use_cache:
+                    step_cache_out.append(layer_new)
+            
+            if use_cache:
+                new_caches.append(step_cache_out)
                 
         x = self.norm_f(x)
         logits = self.lm_head(x)
-        return logits
+        
+        if use_cache:
+            return logits, new_caches
+        else:
+            return logits
 
     @torch.no_grad()
-    def generate(self, initial_board: str, max_actions: int = 81,
-                 temperature: float = 0.0, device: str = 'cpu'):
+    def generate_fast(self, initial_board: str, max_actions: int = 81,
+                      temperature: float = 0.0, device: str = 'cpu'):
         """
-        Stateless Generation for Correctness.
-        Re-forwards the entire sequence at each step.
+        Stateful Generation (Efficient KV Cache).
+        Processes only the new token at each step.
         """
         from models.transformer_v3 import SOS_TOKEN, NUM_ACTIONS, action_to_token, token_to_action, is_action_token
         
@@ -233,21 +286,26 @@ class SudokuURM_AR(nn.Module):
                 token = action_to_token(cell_id, val)
                 given_tokens.append(token)
 
+        # 1. First Forward (Prompt Processing)
         start_tokens = [SOS_TOKEN] + given_tokens
         tokens = torch.tensor([start_tokens], device=device) # [1, seq_len]
+        
+        # Run forward with use_cache=True to build initial cache
+        logits, past_caches = self.forward(tokens, use_cache=True, past_caches=None)
+        
         actions = []
-
         valid_mask = torch.zeros(NUM_ACTIONS, dtype=torch.bool, device=device)
         for cell_id in range(81):
             if cell_id not in filled:
                 start_tok = cell_id * 9
                 valid_mask[start_tok:start_tok + 9] = True
 
+        # Last token input for the loop
+        next_input = tokens[:, -1:] # [1, 1] - Start loop from the last token result
+        
         for _ in range(max_actions):
-            # Forward (Full Sequence)
-            logits = self.forward(tokens)
+            # We already have logits for the last token from the previous step
             next_logits = logits[0, -1, :NUM_ACTIONS]
-
             next_logits = next_logits.masked_fill(~valid_mask, float('-inf'))
 
             if temperature == 0:
@@ -268,9 +326,15 @@ class SudokuURM_AR(nn.Module):
             start_tok = cell_id * 9
             valid_mask[start_tok:start_tok + 9] = False
 
-            tokens = torch.cat([tokens, next_token], dim=1)
+            # Forward only the NEW token
+            logits, past_caches = self.forward(next_token, use_cache=True, past_caches=past_caches)
 
             if len(filled) == 81:
                 break
 
         return actions, board
+
+    # Keep original generate for verification if needed
+    @torch.no_grad()
+    def generate(self, *args, **kwargs):
+        return self.generate_fast(*args, **kwargs)
