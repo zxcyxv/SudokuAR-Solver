@@ -1,6 +1,5 @@
-
 """
-Training script for SudokuTransformerV3 (Unified Action Tokens + Oracle Order)
+Training script for SudokuURM_AR (Autoregressive URM)
 
 Key features:
 - Single token = Position + Value combined
@@ -15,12 +14,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
 
-from models.transformer_v3 import SudokuTransformerV3, VOCAB_SIZE, SOS_TOKEN
+from models.transformer_v3 import VOCAB_SIZE, SOS_TOKEN
+from models.urm_ar import SudokuURM_AR, URMConfig
+from models.muon import Muon
 from dataset.ar_dataset_v3 import SudokuARDatasetV3, collate_fn_v3
 
 # Hyperparams
-BATCH_SIZE = 128
-EPOCHS = 20
+BATCH_SIZE = 64
+EPOCHS = 10
 LR = 1e-3
 WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
@@ -46,16 +47,48 @@ def train():
     print(f"DataLoader Length: {len(train_dl)}")
 
     # 2. Model
-    model = SudokuTransformerV3(
-        num_layers=4,
-        hidden_dim=384,
+    # 2. Model (URM)
+    config = URMConfig(
+        vocab_size=VOCAB_SIZE,
+        hidden_size=384,
+        num_layers=4,       # Physical layers
+        n_recurrence=8,     # Inner Loop count (Recurrence)
         num_heads=6,
-    ).to(DEVICE)
+        expansion=4.0,
+        max_seq_len=82
+    )
+    model = SudokuURM_AR(config).to(DEVICE)
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     print(f"Vocab Size: {VOCAB_SIZE} (729 actions + 1 SOS)")
 
-    # 3. Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95))
+    # 3. Optimizer (Muon)
+    # Muon internally handles 2D params with Newton-Schulz and non-2D with AdamW
+    # We follow the paper's config: lr=0.02 for Muon, 1e-4 for AdamW parts (usually handled via defaults or param groups)
+    # However, to be safe and simple, we pass all params to Muon and let it filter 2D vs non-2D.
+    
+    # Filter params for Muon (2D) and AdamW (non-2D) explicitly to control LRs if needed,
+    # but URM/pretrain.py shows Muon class handling mixed groups.
+    # Let's trust Muon's internal logic or explicit grouping.
+    # Based on URM/pretrain.py:
+    adam_params = [p for p in model.parameters() if p.ndim != 2]
+    muon_params = [p for p in model.parameters() if p.ndim == 2]
+    
+    optimizer = Muon([
+        {
+            "params": muon_params,
+            "use_muon": True,
+            "lr": 0.02, # Default Muon LR
+            "momentum": 0.95,
+            "adamw_betas": (0.9, 0.95),
+        },
+        {
+            "params": adam_params,
+            "use_muon": False,
+            "lr": 1e-3, # Keep original AdamW LR for embeddings/biases
+            "weight_decay": WEIGHT_DECAY,
+            "adamw_betas": (0.9, 0.95),
+        }
+    ])
 
     # 4. Scheduler
     total_steps = len(train_dl) * EPOCHS
@@ -118,7 +151,7 @@ def train():
         print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.2f}%")
 
         # Save checkpoint
-        torch.save(model.state_dict(), f"checkpoints/ar_trm_v3_ep{epoch+1}.pth")
+        torch.save(model.state_dict(), f"checkpoints/ar_urm_v3_ep{epoch+1}.pth")
 
 
 if __name__ == "__main__":
