@@ -236,11 +236,14 @@ class SudokuURM_AR(nn.Module):
         n_freeze = 2 
         
         new_caches = [] if use_cache else None
+        
+        # Deep Supervision: Store intermediate logits
+        all_logits = []
 
         # Recurrence Loop
         for step in range(self.config.n_recurrence):
             # TBPTL Logic
-            if step < n_freeze and self.training: # Apply only during training
+            if step <= n_freeze and self.training: # Apply only during training
                 x = x.detach()
 
             # Loop Coordinate Embedding
@@ -249,7 +252,7 @@ class SudokuURM_AR(nn.Module):
             x = x + loop_signal
             
             step_cache_out = []
-            step_past_caches = past_caches[step] if past_caches is not None else None
+            step_past_caches = past_caches[step] if step_past_caches is not None else None
             
             # Layer Loop
             for layer_idx, layer in enumerate(self.layers):
@@ -262,7 +265,18 @@ class SudokuURM_AR(nn.Module):
             
             if use_cache:
                 new_caches.append(step_cache_out)
+            
+            # Deep Supervision: Collect logits for trainable steps
+            # Train only steps >= n_freeze (and implicitly n_freeze via backprop from n_freeze+1)
+            if self.training and step >= n_freeze:
+                curr_out = self.norm_f(x)
+                curr_logits = self.lm_head(curr_out)
+                all_logits.append(curr_logits)
                 
+        # Return Check
+        if self.training:
+            return all_logits # List[Tensor]
+
         x = self.norm_f(x)
         logits = self.lm_head(x)
         
