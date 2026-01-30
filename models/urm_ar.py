@@ -252,7 +252,7 @@ class SudokuURM_AR(nn.Module):
             x = x + loop_signal
             
             step_cache_out = []
-            step_past_caches = past_caches[step] if past_caches is not None else None
+            step_past_caches = past_caches[step] if step_past_caches is not None else None
             
             # Layer Loop
             for layer_idx, layer in enumerate(self.layers):
