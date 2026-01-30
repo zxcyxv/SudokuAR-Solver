@@ -1,3 +1,4 @@
+
 """
 SudokuTransformer V3: Unified Action Token (Position + Value Combined)
 
@@ -50,6 +51,38 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
+
+def is_valid_sudoku(board):
+    """
+    Check if a 81-length list represents a valid solved Sudoku board.
+    board: List of 81 integers (1-9)
+    """
+    if len(board) != 81 or any(v < 1 or v > 9 for v in board):
+        return False
+
+    # Check rows
+    for i in range(9):
+        row = board[i*9 : (i+1)*9]
+        if len(set(row)) != 9:
+            return False
+
+    # Check columns
+    for i in range(9):
+        col = [board[i + j*9] for j in range(9)]
+        if len(set(col)) != 9:
+            return False
+
+    # Check 3x3 boxes
+    for i in range(0, 9, 3):
+        for j in range(0, 9, 3):
+            box = []
+            for r in range(3):
+                for c in range(3):
+                    box.append(board[(i + r) * 9 + (j + c)])
+            if len(set(box)) != 9:
+                return False
+
+    return True
 
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
